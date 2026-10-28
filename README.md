@@ -1,48 +1,52 @@
 # Casio Exilim EX-V7 Firmware Reverse Engineering & Hacking
 
 ## 1. Target Hardware & Firmware Specifications
-- **Model**: Casio Exilim EX-V7 (2007)
-- **CPU Architecture**: Renesas / Hitachi **SH-2A (SH-4 / SH-2A 32-bit RISC, Big-Endian)**
-- **Operating Subsystem**: Micro-kernel / RTOS with modular tasks (`SYSINI`, `MAIN`, `DISP MNG`, `CCDD`, `LEND`, `ISM`)
-- **Firmware Container**: `EX-V7.BIN` (Version 1.03)
-- **Binary Encoding**: The complete flash image is byte-inverted with `0xFF` (`physical_byte ^ 0xFF == decoded_byte`).
+- **Model**: Casio Exilim EX-V7 (2007, Internal Model Code: `KX-825` / `0x0825`)
+- **CPU / SiP Architecture**: Renesas / Hitachi **SH-2A (`R8J30235EBGV`, 32-bit RISC, Big-Endian, Internal Platform Codename: `Uranus`)**
+- **Operating Subsystem**: uITRON-based micro-kernel / RTOS with modular tasks (`SYSINI`, `MAIN`, `DISP MNG`, `CCDD`, `LEND`, `ISM`)
+- **Firmware Container**: `EX-V7.BIN` (Version 1.03, `2,385,616` bytes / `0x2466d0` bytes)
+- **Binary Encoding**: The retail `EX-V7.BIN` image is bitwise-inverted (`physical_byte ^ 0xFF == decoded_byte`) and prepended with a `0x400`-byte outer container header.
 
 ## 2. Memory Map
 | File Offset Range | Virtual Address (VA) | Component |
 |---|---|---|
-| `0x000000 - 0x000400` | N/A | File Container Header (`1.03.36.00`) |
-| `0x000400 - 0x000480` | `0x30030000` | Loader Header (`.\rom825.lbn`) |
-| `0x004480 - 0x00c480` | `0x10001000` | LoaderUpdater execution code |
-| `0x00c480 - 0x00c500` | `0x10030000` | Main ROM Header (`.\rom825.hbn`) |
-| `0x00c500 - 0x2466d0` | `0x10030080+` | Main System ROM & OS |
+| `0x000000 - 0x000400` | N/A | Retail Container Header (`1.03.36.00`, inner offset `0x400`, size `0x2462d0`) |
+| `0x000400 - 0x000480` | `0x30330000` | LoaderUpdater Header (`.\rom825.lbn`, magic `0xa5a5a5a5`) |
+| `0x000480 - 0x000c80` | `0x10000480` | Stage-1 Hardware Bootloader |
+| `0x004480 - 0x00b550` | `0x10000000` | Stage-2 Recovery Loader (`\uranus.bin` handler) |
+| `0x00c480 - 0x00c500` | `0x10030000` | Main ROM Header (`.\rom825.hbn`, magic `0x00000001`) |
+| `0x00c500 - 0x2466d0` | `0x10030080+` | Main System ROM & OS (`VA = file_offset + 0x10023b80`) |
 
 ## 3. Stabilizer Subsystem Analysis
 - **Image Stabilizer Micom (ISM)**:
   - Communicates with the hardware stabilizer voice coil actuator and gyro sensor.
-  - Status queries run via `0x1003d204` / `0x1003d0e4` (checking internal status registers at `0x10033290` / `0x10033294`).
-  - When the hardware stabilizer is jammed or faulty, `0x1003d204` returns `0x0001` (fault).
-- **Startup Error & Delay Trigger (`0x101894e6`, file `0x165966`)**:
-  - Checks stabilizer status with `jsr/n @0x1003d204`.
-  - On error, triggers LCD dialog `#0x51` ("Camera stabilizer is not available") via `0x10191790`.
-  - Sets warning icon via `0x10191644`.
-  - Deliberately executes a 5-second / 5000-tick delay via `movi20 #0x1388, r4; jsr/n @0x1003815e`.
-  - Marks status flag `0x10295f8c` as handled and resumes camera operation.
+  - Root status query runs via `is_stabilizer_faulty()` at `0x1003d204` (file offset `0x019684`).
+  - When the hardware stabilizer is faulty, `0x1003d204` returns non-zero (`0x0001`), which triggers LCD dialog `#0x51` ("Camera stabilizer is not available"), a 5-second sleep delay at `0x10189544`, and caller retry loops at `0x1019810e`.
+- **Root Fault Suppression (`0x1003d204`)**:
+  - Patching `0x1003d204` to `mov #0x0, r2; rtv/n r2; nop; nop` (`e2 00 02 7b 00 09 00 09`) cleanly suppresses the fault across all tasks while keeping the physical stabilizer unpowered and quiescent.
 
-## 4. Checksum Verification Mechanism
-The firmware updater checks two sets of 32-bit checksums (each consisting of an additive sum and an XOR sum over 32-bit big-endian words):
+## 4. `uranus.bin` Emergency Firmware Restoration Architecture
+When the `[SHUTTER]` button is held depressed while inserting the battery, the Stage-1 Bootloader (`0x0522`) invokes the Stage-2 Recovery Loader at `0x10000000` (file offset `0x04480`):
+1. The recovery loader mounts the SD card (`FAT12` / `FAT16` / `FAT32`) and loads `\uranus.bin` into DRAM at `0x30330000` via `0x1000094c` while blinking the viewfinder LED **green/red**.
+2. Unlike the retail updater (`0x10176e70`), the Stage-2 Recovery Loader expects `\uranus.bin` to be **un-inverted** (`byte ^ 0xFF` already applied) and **stripped of the `0x400`-byte outer retail header** (`inv[0x400:0x2466d0]`).
+3. At `0x10000050`, the recovery loader inspects the 32-bit magic field at header offset `+0x30`:
+   - **`0xa5a5a5a5` (`full` mode, `inv[0x400:0x2466d0]`)**: Verifies the 32-bit additive (`+0x28`) and XOR (`+0x2c`) checksums over `+0x24` (`0x00246250`) bytes via `0x1000011e`, then erases, programs, and verifies flash starting at block 0 (`0x10000340`) while blinking the LED **green**. Turns the LED **steady green** upon completion.
+   - **`0x00000001` (`hbn` mode, `inv[0xc480:0x2466d0]`)**: Verifies checksums over `0x0023a1d0` bytes and flashes only the Main ROM partition starting at Flash Block 3 (`0x00c000`), leaving bootloader blocks 0-2 untouched.
+   - **`0x00000004` (`ram` mode, `inv[0xc480:0x2466d0]`)**: Copies the Main ROM payload directly into executable RAM at `0x10030080` and boots it in memory without writing to flash.
+
+## 5. Checksum Verification Mechanism
+Both updaters verify two sets of 32-bit checksums (each consisting of a 32-bit big-endian word additive sum and XOR sum):
 1. **`rom825.hbn`** (header offset `0xc4a8 - 0xc4b0`):
-   - Additive sum and XOR sum from file offset `0xc500` through `0x2466d0`.
+   - Additive sum and XOR sum from file offset `0xc500` through `0x2466d0` (`0x23a1d0` bytes).
 2. **`rom825.lbn`** (header offset `0x428 - 0x430`):
-   - Additive sum and XOR sum from file offset `0x460` through `0x2466d0`.
+   - Additive sum and XOR sum from file offset `0x480` through `0x2466d0` (`0x246250` bytes).
 
-## 5. Automated Patcher Tool (`patcher.py`)
-Run the Python patcher to apply configurations and recompute all checksums automatically:
+## 6. Automated Patcher & Recovery Builder (`patcher.py`)
+Run `patcher.py` to generate a patched retail update (`EX-V7-PATCHED.BIN`) or export a Stage-2 recovery image (`uranus.bin`):
 ```bash
+# Generate patched retail update image
 python3 patcher.py --input EX-V7.BIN --output EX-V7-PATCHED.BIN
-```
 
-### Configurable Options
-- `--bypass-startup-error`: Bypasses the startup error popup and removes the boot delay (enabled by default).
-- `--enable-menu-reminder`: Re-routes warning dialog `#0x51` to show when opening the AntiShake menu option.
-- `--custom-delay-ms`: Configures delay timer in milliseconds (default: 500ms).
-- `--version-string`: Configures internal version string (e.g. `1.31.36.00`).
+# Also export a Stage-2 recovery image (full, hbn, or ram mode)
+python3 patcher.py --input EX-V7.BIN --output EX-V7-PATCHED.BIN --export-uranus uranus-patched.bin --uranus-mode full
+```
